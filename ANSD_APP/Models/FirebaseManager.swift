@@ -11,6 +11,7 @@ import FirebaseCore
 import FirebaseDatabase
 import FirebaseAuth
 import GoogleSignIn
+import AuthenticationServices
 import CryptoKit
 
 class FirebaseManager {
@@ -589,6 +590,114 @@ class FirebaseManager {
                 }
             }
         }
+    }
+    
+    // MARK: - Apple Sign-In
+    
+    /// Cryptographically random nonce used to prevent replay attacks.
+    /// Stored here so `WelcomeViewController` can embed it in the Apple credential request
+    /// and then pass it back via `completeAppleSignIn(credential:rawNonce:completion:)`.
+    private(set) var currentNonce: String?
+    
+    /// Generates a random nonce, stores it, and returns the SHA-256 hashed version
+    /// that should be embedded in the `ASAuthorizationAppleIDRequest`.
+    func generateNonce() -> String {
+        let rawNonce = randomNonceString()
+        currentNonce = rawNonce
+        return sha256(rawNonce)
+    }
+    
+    /// Call this from `authorizationController(controller:didCompleteWithAuthorization:)`.
+    func completeAppleSignIn(
+        credential: ASAuthorizationAppleIDCredential,
+        rawNonce: String,
+        completion: @escaping (Result<(User, Bool), Error>) -> Void
+    ) {
+        guard let appleIDToken = credential.identityToken,
+              let tokenString = String(data: appleIDToken, encoding: .utf8) else {
+            completion(.failure(NSError(
+                domain: "Auth", code: 0,
+                userInfo: [NSLocalizedDescriptionKey: "Unable to serialize Apple ID token."]
+            )))
+            return
+        }
+        
+        let firebaseCredential = OAuthProvider.appleCredential(
+            withIDToken: tokenString,
+            rawNonce: rawNonce,
+            fullName: credential.fullName
+        )
+        
+        Auth.auth().signIn(with: firebaseCredential) { [weak self] authResult, error in
+            guard let self = self else { return }
+            
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+            
+            guard let firebaseUser = authResult?.user else {
+                completion(.failure(NSError(
+                    domain: "Auth", code: 0,
+                    userInfo: [NSLocalizedDescriptionKey: "Firebase Apple Sign-In failed."]
+                )))
+                return
+            }
+            
+            let isNewUser = authResult?.additionalUserInfo?.isNewUser ?? false
+            if isNewUser {
+                // Apple only provides name on first auth; use PersonNameComponents if available
+                let firstName = credential.fullName?.givenName ?? ""
+                let lastName  = credential.fullName?.familyName ?? ""
+                let fullName  = "\(firstName) \(lastName)".trimmingCharacters(in: .whitespaces)
+                let email     = firebaseUser.email ?? (credential.email ?? "")
+                
+                let userProfile: [String: Any] = [
+                    "firstName":   CryptoHelper.encrypt(firstName) ?? "",
+                    "lastName":    CryptoHelper.encrypt(lastName)  ?? "",
+                    "email":       CryptoHelper.encrypt(email)     ?? "",
+                    "phoneNumber": CryptoHelper.encrypt(firebaseUser.phoneNumber ?? "") ?? "",
+                    "createdAt":   ServerValue.timestamp()
+                ]
+                
+                let safeUID      = self.sanitizeKey(firebaseUser.uid)
+                let safeEmail    = CryptoHelper.hashIdentifier(email.lowercased())
+                let safeFullName = CryptoHelper.hashIdentifier(fullName.lowercased())
+                
+                self.databaseRef.child("users").child(safeUID).child("profile").setValue(userProfile)
+                
+                if !email.isEmpty {
+                    self.databaseRef.child("users_by_email").child(safeEmail).setValue(CryptoHelper.encrypt(firebaseUser.uid) ?? "")
+                }
+                if !fullName.isEmpty {
+                    self.databaseRef.child("users_by_fullname").child(safeFullName).setValue(CryptoHelper.encrypt(firebaseUser.uid) ?? "")
+                }
+            }
+            
+            completion(.success((firebaseUser, isNewUser)))
+        }
+    }
+    
+    // MARK: - Apple Nonce Helpers (private)
+    
+    private func randomNonceString(length: Int = 32) -> String {
+        precondition(length > 0)
+        var randomBytes = [UInt8](repeating: 0, count: length)
+        let errorCode = SecRandomCopyBytes(kSecRandomDefault, randomBytes.count, &randomBytes)
+        if errorCode != errSecSuccess {
+            fatalError("Unable to generate nonce. SecRandomCopyBytes failed with OSStatus \(errorCode)")
+        }
+        let charset: [Character] = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVXYZabcdefghijklmnopqrstuvwxyz-._")
+        let nonce = randomBytes.map { byte in
+            charset[Int(byte) % charset.count]
+        }
+        return String(nonce)
+    }
+    
+    private func sha256(_ input: String) -> String {
+        let inputData = Data(input.utf8)
+        let hashedData = SHA256.hash(data: inputData)
+        return hashedData.compactMap { String(format: "%02x", $0) }.joined()
     }
     
     // MARK: - Google Sign-In

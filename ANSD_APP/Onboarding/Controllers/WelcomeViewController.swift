@@ -9,6 +9,7 @@
 import UIKit
 import GoogleSignIn
 import FirebaseAuth
+import AuthenticationServices
 
 class WelcomeViewController: UIViewController, UITextFieldDelegate {
 
@@ -99,9 +100,19 @@ class WelcomeViewController: UIViewController, UITextFieldDelegate {
 
     // MARK: - Actions
     @IBAction func appleSignInTapped(_ sender: UIButton) {
-        let alert = UIAlertController(title: "Not Available", message: "Apple Sign-In is currently under development. Please use Google Sign-In or Email.", preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alert, animated: true)
+        appleSignInButton.isEnabled = false
+
+        let hashedNonce = FirebaseManager.shared.generateNonce()
+
+        let provider = ASAuthorizationAppleIDProvider()
+        let request  = provider.createRequest()
+        request.requestedScopes = [.fullName, .email]
+        request.nonce = hashedNonce
+
+        let controller = ASAuthorizationController(authorizationRequests: [request])
+        controller.delegate = self
+        controller.presentationContextProvider = self
+        controller.performRequests()
     }
 
     @IBAction func googleSignInTapped(_ sender: UIButton) {
@@ -550,6 +561,54 @@ extension UIImage {
         return UIGraphicsImageRenderer(size: size).image { _ in
             draw(in: CGRect(origin: .zero, size: size))
         }
+    }
+}
+
+// MARK: - Apple Sign-In Delegates
+extension WelcomeViewController: ASAuthorizationControllerDelegate {
+
+    func authorizationController(controller: ASAuthorizationController,
+                                 didCompleteWithAuthorization authorization: ASAuthorization) {
+        guard let appleCredential = authorization.credential as? ASAuthorizationAppleIDCredential,
+              let rawNonce = FirebaseManager.shared.currentNonce else {
+            DispatchQueue.main.async { self.appleSignInButton.isEnabled = true }
+            showAlert(title: "Sign In Failed", message: "Apple credential or nonce was missing.")
+            return
+        }
+
+        FirebaseManager.shared.completeAppleSignIn(
+            credential: appleCredential,
+            rawNonce: rawNonce
+        ) { [weak self] result in
+            DispatchQueue.main.async {
+                self?.appleSignInButton.isEnabled = true
+
+                switch result {
+                case .success(let (user, isNewUser)):
+                    self?.restoreUserAndNavigate(user: user, isNewUser: isNewUser)
+
+                case .failure(let error):
+                    self?.showAlert(title: "Sign In Failed", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    func authorizationController(controller: ASAuthorizationController,
+                                 didCompleteWithError error: Error) {
+        DispatchQueue.main.async {
+            self.appleSignInButton.isEnabled = true
+            // ASAuthorizationError.canceled (code 1001) means the user dismissed the sheet — no alert needed.
+            if (error as? ASAuthorizationError)?.code != .canceled {
+                self.showAlert(title: "Sign In Failed", message: error.localizedDescription)
+            }
+        }
+    }
+}
+
+extension WelcomeViewController: ASAuthorizationControllerPresentationContextProviding {
+    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        return view.window!
     }
 }
 
